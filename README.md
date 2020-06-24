@@ -1,4 +1,4 @@
-Issue tracked at [traviscross/mtr #XXX]().
+Issue tracked on [traviscross/mtr #353](https://github.com/traviscross/mtr/issues/353).
 
 When using MTR inside a Docker container on MacOS, it's possible to have negative latency values.
 
