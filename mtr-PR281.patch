@@ -1,0 +1,174 @@
+From b8999bdc7ebc18b075abc11c6c777185e7bbd1a8 Mon Sep 17 00:00:00 2001
+From: David Hill <dhill@mindcry.org>
+Date: Thu, 6 Dec 2018 18:15:28 -0500
+Subject: [PATCH] Use monotonic clock.
+
+This avoids a jumping system clock causing issues.
+---
+ configure.ac        |  4 ++++
+ packet/probe_unix.c | 20 ++++++++++----------
+ packet/timeval.c    | 22 ++++++++++++++++++++++
+ packet/timeval.h    |  3 +++
+ ui/select.c         | 16 +++++++++++++---
+ 5 files changed, 52 insertions(+), 13 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index e41e06e..70392b9 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -114,6 +114,10 @@ AC_CHECK_LIB([cap], [cap_set_proc], [],
+   AS_IF([test "$host_os" = linux-gnu],
+     AC_MSG_WARN([Capabilities support is strongly recommended for increased security.  See SECURITY for more information.])))
+ 
++AC_CHECK_FUNC([clock_gettime], [
++  AC_DEFINE([HAVE_CLOCK_GETTIME], [1], [Define if your system has clock_gettime])
++])
++
+ # Enable ipinfo
+ AC_ARG_WITH([ipinfo],
+   [AS_HELP_STRING([--without-ipinfo], [Do not try to use ipinfo lookup at all])],
+diff --git a/packet/probe_unix.c b/packet/probe_unix.c
+index fec3d47..78b797b 100644
+--- a/packet/probe_unix.c
++++ b/packet/probe_unix.c
+@@ -566,8 +566,8 @@ void send_probe(
+         return;
+     }
+ 
+-    if (gettimeofday(&probe->platform.departure_time, NULL)) {
+-        error(EXIT_FAILURE, errno, "gettimeofday failure");
++    if (getmonotime(&probe->platform.departure_time)) {
++        error(EXIT_FAILURE, errno, "getmonotime failure");
+     }
+ 
+     // there might be an off-by-one in the number of tries here. 
+@@ -667,8 +667,8 @@ void receive_probe(
+     struct timeval now;
+ 
+     if (timestamp == NULL) {
+-        if (gettimeofday(&now, NULL)) {
+-            error(EXIT_FAILURE, errno, "gettimeofday failure");
++        if (getmonotime(&now)) {
++            error(EXIT_FAILURE, errno, "getmonotime failure");
+         }
+ 
+         timestamp = &now;
+@@ -726,8 +726,8 @@ void receive_replies_from_recv_socket(
+            Get the time immediately after reading the packet to
+            keep the timing as precise as we can.
+          */
+-        if (gettimeofday(&timestamp, NULL)) {
+-            error(EXIT_FAILURE, errno, "gettimeofday failure");
++        if (getmonotime(&timestamp)) {
++            error(EXIT_FAILURE, errno, "getmonotime failure");
+         }
+ 
+         if (packet_length == -1) {
+@@ -975,8 +975,8 @@ void check_probe_timeouts(
+     struct probe_t *probe;
+     struct probe_t *probe_safe_iter;
+ 
+-    if (gettimeofday(&now, NULL)) {
+-        error(EXIT_FAILURE, errno, "gettimeofday failure");
++    if (getmonotime(&now)) {
++        error(EXIT_FAILURE, errno, "getmonotime failure");
+     }
+ 
+     LIST_FOREACH_SAFE(probe, &net_state->outstanding_probes,
+@@ -1008,8 +1008,8 @@ bool get_next_probe_timeout(
+     struct timeval now;
+     struct timeval probe_timeout;
+ 
+-    if (gettimeofday(&now, NULL)) {
+-        error(EXIT_FAILURE, errno, "gettimeofday failure");
++    if (getmonotime(&now)) {
++        error(EXIT_FAILURE, errno, "getmonotime failure");
+     }
+ 
+     have_timeout = false;
+diff --git a/packet/timeval.c b/packet/timeval.c
+index 11aa414..8c65f56 100644
+--- a/packet/timeval.c
++++ b/packet/timeval.c
+@@ -16,8 +16,31 @@
+     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ */
+ 
++#ifdef HAVE_CLOCK_GETTIME
++#include <time.h>
++#endif
++#include <stddef.h> // Added by JFL
++
+ #include "timeval.h"
+ 
++/*
++    Return timeval using monotonic clock.
++*/
++int getmonotime(
++    struct timeval *tv)
++{
++#ifdef HAVE_CLOCK_GETTIME
++    struct timespec ts;
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return -1;
++    }
++    TIMESPEC_TO_TIMEVAL(tv, &ts);
++    return 0;
++#else
++    return gettimeofday(tv, NULL);
++#endif
++}
++
+ /*
+     Ensure that a timevalue has a microsecond value in the range
+     [0.0, 1.0e6) microseconds by converting microseconds to full seconds.
+diff --git a/packet/timeval.h b/packet/timeval.h
+index 7de980b..c1028dd 100644
+--- a/packet/timeval.h
++++ b/packet/timeval.h
+@@ -21,6 +21,9 @@
+ 
+ #include <sys/time.h>
+ 
++int getmonotime(
++    struct timeval *timeval);
++
+ void normalize_timeval(
+     struct timeval *timeval);
+ 
+diff --git a/ui/select.c b/ui/select.c
+index 26748ac..de10ce8 100644
+--- a/ui/select.c
++++ b/ui/select.c
+@@ -62,9 +62,15 @@ void select_loop(
+     struct timeval intervaltime;
+     static double dnsinterval = 0;
+ 
+-    memset(&startgrace, 0, sizeof(startgrace));
+-
++#ifdef HAVE_CLOCK_GETTIME
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    TIMESPEC_TO_TIMEVAL(&lasttime, &ts);
++#else
+     gettimeofday(&lasttime, NULL);
++#endif
++
++    memset(&startgrace, 0, sizeof(startgrace));
+ 
+     while (1) {
+         dt = calc_deltatime(ctl->WaitTime);
+@@ -123,8 +129,12 @@ void select_loop(
+                 if (ctl->Interactive)
+                     display_redraw(ctl);
+ 
++#ifdef HAVE_CLOCK_GETTIME
++                clock_gettime(CLOCK_MONOTONIC, &ts);
++                TIMESPEC_TO_TIMEVAL(&thistime, &ts);
++#else
+                 gettimeofday(&thistime, NULL);
+-
++#endif
+                 if (thistime.tv_sec > lasttime.tv_sec + intervaltime.tv_sec
+                     || (thistime.tv_sec ==
+                         lasttime.tv_sec + intervaltime.tv_sec
